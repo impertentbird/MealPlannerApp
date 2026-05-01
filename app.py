@@ -119,7 +119,11 @@ with tab2:
         for index, meal in enumerate(saved_meals):
             meal_id, title, img_url = meal
             with cols[index % 3]:
-                st.image(img_url, use_container_width=True)
+                # NEW: HTML magic to force uniform sizing and add rounded corners!
+                st.markdown(f'''
+                    <img src="{img_url}" style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; margin-bottom: 10px;">
+                ''', unsafe_allow_html=True)
+                
                 is_selected = st.checkbox(f"**{title}**", key=f"chk_{meal_id}")
                 if is_selected: selected_meal_ids.append(meal_id)
                 st.write("---")
