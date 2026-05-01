@@ -1,8 +1,8 @@
 import streamlit as st
 from recipe_scrapers import scrape_me
-import sqlite3
+import psycopg2 # NEW: The Cloud Database driver!
 from collections import Counter
-from datetime import datetime, timedelta # NEW: Gives our app a sense of time!
+from datetime import datetime, timedelta
 
 # --- 1. OUR CUSTOM INGREDIENT CLEANER ---
 def get_core_ingredient(raw_string):
@@ -24,26 +24,24 @@ def get_core_ingredient(raw_string):
     return " ".join(core_words).title()
 
 # --- 2. DATABASE SETUP ---
+# NEW: Connects directly to Neon using your Streamlit Secret!
+def get_db_connection():
+    return psycopg2.connect(st.secrets["DATABASE_URL"])
+
 def init_db():
-    conn = sqlite3.connect('meals.db')
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS meals (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, url TEXT, image_url TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS ingredients (id INTEGER PRIMARY KEY AUTOINCREMENT, meal_id INTEGER, name TEXT, FOREIGN KEY (meal_id) REFERENCES meals (id))''')
-    c.execute('''CREATE TABLE IF NOT EXISTS staples (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, frequency TEXT)''')
-    
-    # NEW: Automatically upgrade the database if it doesn't have the date columns yet
-    try:
-        c.execute("ALTER TABLE staples ADD COLUMN last_purchased TEXT")
-        c.execute("ALTER TABLE staples ADD COLUMN next_due TEXT")
-    except sqlite3.OperationalError:
-        pass # The columns already exist, skip!
-        
+    # Postgres uses "SERIAL" instead of "AUTOINCREMENT"
+    c.execute('''CREATE TABLE IF NOT EXISTS meals (id SERIAL PRIMARY KEY, title TEXT, url TEXT, image_url TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS ingredients (id SERIAL PRIMARY KEY, meal_id INTEGER REFERENCES meals (id), name TEXT)''')
+    # Because this is a fresh database, we can create all the date columns right from the start!
+    c.execute('''CREATE TABLE IF NOT EXISTS staples (id SERIAL PRIMARY KEY, name TEXT, frequency TEXT, last_purchased TEXT, next_due TEXT)''')
     conn.commit()
     conn.close()
 
 init_db() 
 
-# --- HELPER FUNCTION: Calculate Due Dates ---
+# --- HELPER FUNCTION ---
 def calculate_next_due(frequency):
     today = datetime.now()
     if frequency == "Every 1 week": return (today + timedelta(days=7)).strftime("%Y-%m-%d")
@@ -71,10 +69,12 @@ with tab1:
                 try: image_url = scraper.image()
                 except: image_url = "https://via.placeholder.com/400x300.png?text=No+Picture+Available"
                 
-                conn = sqlite3.connect('meals.db')
+                conn = get_db_connection()
                 c = conn.cursor()
-                c.execute("INSERT INTO meals (title, url, image_url) VALUES (?, ?, ?)", (recipe_title, recipe_url, image_url))
-                meal_id = c.lastrowid 
+                # NEW: Postgres needs "RETURNING id" to know what row it just made
+                c.execute("INSERT INTO meals (title, url, image_url) VALUES (%s, %s, %s) RETURNING id", (recipe_title, recipe_url, image_url))
+                meal_id = c.fetchone()[0] 
+                
                 st.success(f"Successfully saved: **{recipe_title}**!")
                 
                 try:
@@ -82,7 +82,7 @@ with tab1:
                     for item in ingredients:
                         clean_item = get_core_ingredient(item)
                         if clean_item.strip(): 
-                            c.execute("INSERT INTO ingredients (meal_id, name) VALUES (?, ?)", (meal_id, clean_item))
+                            c.execute("INSERT INTO ingredients (meal_id, name) VALUES (%s, %s)", (meal_id, clean_item))
                 except: pass
                 conn.commit()
                 conn.close()
@@ -91,10 +91,9 @@ with tab1:
         else:
             st.warning("Please paste a URL first!")
 
-# --- TAB 2: VIEWING THE PLANNER & SMART LIST ---
+# --- TAB 2: VIEWING THE PLANNER ---
 with tab2:
-    # SMART ALERT: Check for staples running low!
-    conn = sqlite3.connect('meals.db')
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT name, next_due FROM staples")
     all_staples = c.fetchall()
@@ -102,7 +101,7 @@ with tab2:
     low_staples = []
     today_str = datetime.now().strftime("%Y-%m-%d")
     for staple in all_staples:
-        if staple[1] and staple[1] <= today_str: # If due date is today or in the past
+        if staple[1] and staple[1] <= today_str: 
             low_staples.append(staple[0])
             
     if low_staples:
@@ -127,7 +126,7 @@ with tab2:
         
         if len(selected_meal_ids) > 0:
             st.write("### 🛒 Your Interactive Shopping List")
-            placeholders = ','.join('?' * len(selected_meal_ids))
+            placeholders = ','.join(['%s'] * len(selected_meal_ids)) # NEW: Postgres uses %s
             c.execute(f"SELECT name FROM ingredients WHERE meal_id IN ({placeholders})", selected_meal_ids)
             tallied_ingredients = Counter([item[0] for item in c.fetchall()])
             
@@ -153,22 +152,17 @@ with tab2:
                     else: st.write(f"- {display_s_name}")
             
             st.write("---")
-            # --- NEW: CHECKOUT BUTTON ---
             if st.button("✅ Checkout & Update Inventory", type="primary"):
                 items_updated = 0
                 today_str = datetime.now().strftime("%Y-%m-%d")
-                
-                # Check which staples are in the basket using Streamlit's session state memory
                 c.execute("SELECT id, name, frequency FROM staples")
                 for s_id, s_name, s_freq in c.fetchall():
-                    # If this staple was checked off as "In Basket"
                     if st.session_state.get(f"sbasket_{s_name}", False):
                         next_due = calculate_next_due(s_freq)
-                        c.execute("UPDATE staples SET last_purchased = ?, next_due = ? WHERE id = ?", (today_str, next_due, s_id))
+                        c.execute("UPDATE staples SET last_purchased = %s, next_due = %s WHERE id = %s", (today_str, next_due, s_id))
                         items_updated += 1
-                        
                 conn.commit()
-                st.success(f"Checkout complete! Updated dates for {items_updated} staples. Uncheck your boxes for your next trip!")
+                st.success(f"Checkout complete! Updated dates for {items_updated} staples.")
     conn.close()
 
 # --- TAB 3: RECURRING STAPLES ---
@@ -180,18 +174,18 @@ with tab3:
         
     if st.button("Save Staple"):
         if staple_name:
-            conn = sqlite3.connect('meals.db')
+            conn = get_db_connection()
             c = conn.cursor()
             next_due = calculate_next_due(frequency)
             today_str = datetime.now().strftime("%Y-%m-%d")
-            c.execute("INSERT INTO staples (name, frequency, last_purchased, next_due) VALUES (?, ?, ?, ?)", (staple_name.title(), frequency, today_str, next_due))
+            c.execute("INSERT INTO staples (name, frequency, last_purchased, next_due) VALUES (%s, %s, %s, %s)", (staple_name.title(), frequency, today_str, next_due))
             conn.commit()
             conn.close()
             st.success(f"Added **{staple_name.title()}**! Next due: {next_due}")
             
     st.write("---")
     st.write("### 📋 Your Current Staples")
-    conn = sqlite3.connect('meals.db')
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT name, frequency, next_due FROM staples")
     saved_staples = c.fetchall()
@@ -202,12 +196,58 @@ with tab3:
             due_text = staple[2] if staple[2] else "Not tracked yet"
             st.write(f"- **{staple[0]}** *(Buys: {staple[1]})* | **Due:** {due_text}")
 
-# --- TAB 4 & 5 OMITTED FOR BREVITY (Keep your existing Tab 4 and Tab 5 exactly the same!) ---
+# --- TAB 4: MANUAL RECIPE ENTRY ---
 with tab4:
     st.write("### 📝 Add Your Own Family Recipe")
-    # (Keep your Tab 4 code here)
+    manual_title = st.text_input("Recipe Name:", placeholder="e.g., Grandma's Lasagna")
+    manual_image = st.text_input("Image Link (Optional):", placeholder="Paste an image URL here")
+    st.write("Type your ingredients below. **Put each ingredient on a new line.**")
+    manual_ingredients = st.text_area("Ingredients:", height=200)
+    
+    if st.button("Save Custom Recipe"):
+        if manual_title and manual_ingredients:
+            final_image = manual_image if manual_image else "https://via.placeholder.com/400x300.png?text=Family+Recipe"
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute("INSERT INTO meals (title, url, image_url) VALUES (%s, %s, %s) RETURNING id", (manual_title, "Manual Entry", final_image))
+            meal_id = c.fetchone()[0] 
+            lines = manual_ingredients.split('\n')
+            for line in lines:
+                if line.strip(): 
+                    clean_item = get_core_ingredient(line)
+                    if clean_item.strip():
+                        c.execute("INSERT INTO ingredients (meal_id, name) VALUES (%s, %s)", (meal_id, clean_item))
+            conn.commit()
+            conn.close()
+            st.success(f"Successfully saved **{manual_title}**!")
+        else:
+            st.warning("Please provide both a title and some ingredients.")
 
+# --- TAB 5: DELETE RECIPES ---
 with tab5:
     st.write("### 🗑️ Delete a Recipe")
-    # (Keep your Tab 5 code here)
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT id, title FROM meals")
+    all_meals = c.fetchall()
+    
+    if len(all_meals) == 0:
+        st.info("Your database is currently empty.")
+    else:
+        delete_dict = {meal[1]: meal[0] for meal in all_meals}
+        options = ["-- Select a recipe to delete --"] + list(delete_dict.keys())
+        recipe_to_delete = st.selectbox("Choose a recipe:", options)
+        
+        if st.button("Permanently Delete", type="primary"):
+            if recipe_to_delete != "-- Select a recipe to delete --":
+                meal_id_to_delete = delete_dict[recipe_to_delete]
+                c.execute("DELETE FROM ingredients WHERE meal_id = %s", (meal_id_to_delete,))
+                c.execute("DELETE FROM meals WHERE id = %s", (meal_id_to_delete,))
+                conn.commit()
+                conn.close()
+                st.rerun()
+            else:
+                st.warning("Please select a valid recipe from the dropdown first.")
+    try: conn.close() 
+    except: pass
         

@@ -1,2 +1,3 @@
 streamlit
 recipe-scrapers
+psycopg2-binary
