@@ -136,7 +136,6 @@ with tab2:
                 if is_selected != on_menu:
                     c.execute("UPDATE meals SET on_menu = %s WHERE id = %s", (is_selected, meal_id))
                     conn.commit()
-                    st.rerun()
                 st.write("---")
         
         # --- SHOPPING LIST BUILDER ---
