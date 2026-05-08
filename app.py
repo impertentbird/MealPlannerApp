@@ -1,6 +1,6 @@
 import streamlit as st
 from recipe_scrapers import scrape_me
-import psycopg2 # NEW: The Cloud Database driver!
+import psycopg2 
 from collections import Counter
 from datetime import datetime, timedelta
 
@@ -24,19 +24,23 @@ def get_core_ingredient(raw_string):
     return " ".join(core_words).title()
 
 # --- 2. DATABASE SETUP ---
-# NEW: Connects directly to Neon using your Streamlit Secret!
 def get_db_connection():
     return psycopg2.connect(st.secrets["DATABASE_URL"])
 
 def init_db():
     conn = get_db_connection()
     c = conn.cursor()
-    # Postgres uses "SERIAL" instead of "AUTOINCREMENT"
     c.execute('''CREATE TABLE IF NOT EXISTS meals (id SERIAL PRIMARY KEY, title TEXT, url TEXT, image_url TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS ingredients (id SERIAL PRIMARY KEY, meal_id INTEGER REFERENCES meals (id), name TEXT)''')
-    # Because this is a fresh database, we can create all the date columns right from the start!
     c.execute('''CREATE TABLE IF NOT EXISTS staples (id SERIAL PRIMARY KEY, name TEXT, frequency TEXT, last_purchased TEXT, next_due TEXT)''')
-    conn.commit()
+    
+    # NEW: Automatically upgrade the meals table for Multiplayer Syncing!
+    try:
+        c.execute("ALTER TABLE meals ADD COLUMN on_menu BOOLEAN DEFAULT FALSE")
+        conn.commit()
+    except Exception:
+        conn.rollback() # If the column already exists, just ignore and keep going
+        
     conn.close()
 
 init_db() 
@@ -71,8 +75,7 @@ with tab1:
                 
                 conn = get_db_connection()
                 c = conn.cursor()
-                # NEW: Postgres needs "RETURNING id" to know what row it just made
-                c.execute("INSERT INTO meals (title, url, image_url) VALUES (%s, %s, %s) RETURNING id", (recipe_title, recipe_url, image_url))
+                c.execute("INSERT INTO meals (title, url, image_url, on_menu) VALUES (%s, %s, %s, FALSE) RETURNING id", (recipe_title, recipe_url, image_url))
                 meal_id = c.fetchone()[0] 
                 
                 st.success(f"Successfully saved: **{recipe_title}**!")
@@ -91,7 +94,7 @@ with tab1:
         else:
             st.warning("Please paste a URL first!")
 
-# --- TAB 2: VIEWING THE PLANNER ---
+# --- TAB 2: VIEWING THE PLANNER (MULTIPLAYER ENABLED) ---
 with tab2:
     conn = get_db_connection()
     c = conn.cursor()
@@ -108,29 +111,42 @@ with tab2:
         st.warning(f"🔔 **Smart Reminder:** You are projected to be running low on: **{', '.join(low_staples)}**!")
 
     st.write("### 👨‍🍳 Choose Your Dinners!")
-    c.execute("SELECT id, title, image_url FROM meals")
+    # NEW: We now pull the "on_menu" status directly from the database
+    c.execute("SELECT id, title, image_url, on_menu FROM meals")
     saved_meals = c.fetchall() 
     
     if len(saved_meals) == 0:
         st.info("You haven't saved any meals yet.")
     else:
         cols = st.columns(3)
-        selected_meal_ids = []
+        
         for index, meal in enumerate(saved_meals):
-            meal_id, title, img_url = meal
+            meal_id, title, img_url, on_menu = meal
+            on_menu = bool(on_menu) # Make sure it's a True/False value
+            
             with cols[index % 3]:
-                # NEW: HTML magic to force uniform sizing and add rounded corners!
                 st.markdown(f'''
                     <img src="{img_url}" style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; margin-bottom: 10px;">
                 ''', unsafe_allow_html=True)
                 
-                is_selected = st.checkbox(f"**{title}**", key=f"chk_{meal_id}")
-                if is_selected: selected_meal_ids.append(meal_id)
+                # Checkbox reads from the database!
+                is_selected = st.checkbox(f"**{title}**", value=on_menu, key=f"chk_{meal_id}")
+                
+                # If someone clicks the checkbox, save it to the cloud instantly and refresh!
+                if is_selected != on_menu:
+                    c.execute("UPDATE meals SET on_menu = %s WHERE id = %s", (is_selected, meal_id))
+                    conn.commit()
+                    st.rerun()
                 st.write("---")
+        
+        # --- SHOPPING LIST BUILDER ---
+        # Get all meals where on_menu is TRUE
+        c.execute("SELECT id FROM meals WHERE on_menu = TRUE")
+        selected_meal_ids = [row[0] for row in c.fetchall()]
         
         if len(selected_meal_ids) > 0:
             st.write("### 🛒 Your Interactive Shopping List")
-            placeholders = ','.join(['%s'] * len(selected_meal_ids)) # NEW: Postgres uses %s
+            placeholders = ','.join(['%s'] * len(selected_meal_ids)) 
             c.execute(f"SELECT name FROM ingredients WHERE meal_id IN ({placeholders})", selected_meal_ids)
             tallied_ingredients = Counter([item[0] for item in c.fetchall()])
             
@@ -156,17 +172,29 @@ with tab2:
                     else: st.write(f"- {display_s_name}")
             
             st.write("---")
-            if st.button("✅ Checkout & Update Inventory", type="primary"):
+            
+            # --- UPDATED CHECKOUT BUTTON ---
+            if st.button("✅ Checkout & Wipe Menu", type="primary"):
                 items_updated = 0
                 today_str = datetime.now().strftime("%Y-%m-%d")
+                
+                # 1. Update Staples
                 c.execute("SELECT id, name, frequency FROM staples")
                 for s_id, s_name, s_freq in c.fetchall():
                     if st.session_state.get(f"sbasket_{s_name}", False):
                         next_due = calculate_next_due(s_freq)
                         c.execute("UPDATE staples SET last_purchased = %s, next_due = %s WHERE id = %s", (today_str, next_due, s_id))
                         items_updated += 1
+                
+                # 2. NEW: Wipe the Family Menu clean!
+                c.execute("UPDATE meals SET on_menu = FALSE")
+                
                 conn.commit()
-                st.success(f"Checkout complete! Updated dates for {items_updated} staples.")
+                st.success(f"Checkout complete! Updated dates for {items_updated} staples, and wiped the menu clean for next week!")
+                
+                # Refresh the page to show the empty grid
+                st.rerun()
+
     conn.close()
 
 # --- TAB 3: RECURRING STAPLES ---
@@ -213,7 +241,7 @@ with tab4:
             final_image = manual_image if manual_image else "https://via.placeholder.com/400x300.png?text=Family+Recipe"
             conn = get_db_connection()
             c = conn.cursor()
-            c.execute("INSERT INTO meals (title, url, image_url) VALUES (%s, %s, %s) RETURNING id", (manual_title, "Manual Entry", final_image))
+            c.execute("INSERT INTO meals (title, url, image_url, on_menu) VALUES (%s, %s, %s, FALSE) RETURNING id", (manual_title, "Manual Entry", final_image))
             meal_id = c.fetchone()[0] 
             lines = manual_ingredients.split('\n')
             for line in lines:
@@ -254,4 +282,3 @@ with tab5:
                 st.warning("Please select a valid recipe from the dropdown first.")
     try: conn.close() 
     except: pass
-        
