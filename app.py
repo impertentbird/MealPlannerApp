@@ -27,6 +27,7 @@ def get_core_ingredient(raw_string):
 def get_db_connection():
     return psycopg2.connect(st.secrets["DATABASE_URL"])
 
+@st.cache_resource 
 def init_db():
     conn = get_db_connection()
     c = conn.cursor()
@@ -34,12 +35,11 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS ingredients (id SERIAL PRIMARY KEY, meal_id INTEGER REFERENCES meals (id), name TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS staples (id SERIAL PRIMARY KEY, name TEXT, frequency TEXT, last_purchased TEXT, next_due TEXT)''')
     
-    # NEW: Automatically upgrade the meals table for Multiplayer Syncing!
     try:
         c.execute("ALTER TABLE meals ADD COLUMN on_menu BOOLEAN DEFAULT FALSE")
         conn.commit()
     except Exception:
-        conn.rollback() # If the column already exists, just ignore and keep going
+        conn.rollback() 
         
     conn.close()
 
@@ -53,6 +53,59 @@ def calculate_next_due(frequency):
     if frequency == "Every 3 weeks": return (today + timedelta(days=21)).strftime("%Y-%m-%d")
     if frequency == "Every 4 weeks": return (today + timedelta(days=28)).strftime("%Y-%m-%d")
     return today.strftime("%Y-%m-%d")
+
+
+# --- NEW: THE MAGIC FRAGMENT BUBBLE ---
+# Anything inside this function updates instantly without hitting the database!
+@st.fragment
+def render_interactive_list(tallied_ingredients, all_staples):
+    st.write("### 🛒 Your Interactive Shopping List")
+    
+    for i, (item, count) in enumerate(tallied_ingredients.items()):
+        col_name, col_basket, col_pantry = st.columns([0.5, 0.25, 0.25])
+        with col_basket: in_basket = st.checkbox("🛒 Basket", key=f"basket_{i}_{item}")
+        with col_pantry: in_pantry = st.checkbox("🏠 Have It", key=f"pantry_{i}_{item}")
+        with col_name:
+            display_name = f"{item} **(x{count})**" if count > 1 else f"{item}"
+            if in_basket or in_pantry: st.write(f"~~{display_name}~~")
+            else: st.write(f"- {display_name}")
+    
+    st.write("---")
+    st.write("### 🥛 Recurring Staples")
+    for staple in all_staples:
+        s_id = staple[0]
+        item_name = staple[1]
+        
+        col_s_name, col_s_basket, col_s_pantry = st.columns([0.5, 0.25, 0.25])
+        with col_s_basket: s_in_basket = st.checkbox("🛒 Basket", key=f"sbasket_{s_id}")
+        with col_s_pantry: s_in_pantry = st.checkbox("🏠 Have It", key=f"spantry_{s_id}")
+        with col_s_name:
+            display_s_name = f"**{item_name}**"
+            if s_in_basket or s_in_pantry: st.write(f"~~{display_s_name}~~")
+            else: st.write(f"- {display_s_name}")
+    
+    st.write("---")
+    # We only connect to the database when they explicitly click Checkout
+    if st.button("✅ Checkout & Wipe Menu", type="primary"):
+        conn = get_db_connection()
+        c = conn.cursor()
+        items_updated = 0
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        
+        for staple in all_staples:
+            s_id = staple[0]
+            s_freq = staple[2]
+            if st.session_state.get(f"sbasket_{s_id}", False):
+                next_due = calculate_next_due(s_freq)
+                c.execute("UPDATE staples SET last_purchased = %s, next_due = %s WHERE id = %s", (today_str, next_due, s_id))
+                items_updated += 1
+        
+        c.execute("UPDATE meals SET on_menu = FALSE")
+        conn.commit()
+        conn.close()
+        st.success(f"Checkout complete! Updated dates for {items_updated} staples, and wiped the menu clean!")
+        st.rerun() # This forces the whole app to refresh and clear the screen
+
 
 # --- 3. THE DASHBOARD ---
 st.set_page_config(page_title="My Meal Planner", page_icon="🍳", layout="wide")
@@ -77,7 +130,6 @@ with tab1:
                 c = conn.cursor()
                 c.execute("INSERT INTO meals (title, url, image_url, on_menu) VALUES (%s, %s, %s, FALSE) RETURNING id", (recipe_title, recipe_url, image_url))
                 meal_id = c.fetchone()[0] 
-                
                 st.success(f"Successfully saved: **{recipe_title}**!")
                 
                 try:
@@ -94,24 +146,25 @@ with tab1:
         else:
             st.warning("Please paste a URL first!")
 
-# --- TAB 2: VIEWING THE PLANNER (MULTIPLAYER ENABLED) ---
+# --- TAB 2: VIEWING THE PLANNER ---
 with tab2:
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT name, next_due FROM staples")
+    
+    # Fetch all our data at once
+    c.execute("SELECT id, name, frequency, next_due FROM staples") 
     all_staples = c.fetchall()
     
     low_staples = []
     today_str = datetime.now().strftime("%Y-%m-%d")
     for staple in all_staples:
-        if staple[1] and staple[1] <= today_str: 
-            low_staples.append(staple[0])
+        if staple[3] and staple[3] <= today_str: 
+            low_staples.append(staple[1])
             
     if low_staples:
         st.warning(f"🔔 **Smart Reminder:** You are projected to be running low on: **{', '.join(low_staples)}**!")
 
     st.write("### 👨‍🍳 Choose Your Dinners!")
-    # NEW: We now pull the "on_menu" status directly from the database
     c.execute("SELECT id, title, image_url, on_menu FROM meals")
     saved_meals = c.fetchall() 
     
@@ -119,82 +172,39 @@ with tab2:
         st.info("You haven't saved any meals yet.")
     else:
         cols = st.columns(3)
-        
         for index, meal in enumerate(saved_meals):
             meal_id, title, img_url, on_menu = meal
-            on_menu = bool(on_menu) # Make sure it's a True/False value
+            on_menu = bool(on_menu) 
             
             with cols[index % 3]:
                 st.markdown(f'''
                     <img src="{img_url}" style="width: 100%; height: 200px; object-fit: cover; border-radius: 8px; margin-bottom: 10px;">
                 ''', unsafe_allow_html=True)
                 
-                # Checkbox reads from the database!
                 is_selected = st.checkbox(f"**{title}**", value=on_menu, key=f"chk_{meal_id}")
-                
-                # If someone clicks the checkbox, save it to the cloud instantly and refresh!
                 if is_selected != on_menu:
                     c.execute("UPDATE meals SET on_menu = %s WHERE id = %s", (is_selected, meal_id))
                     conn.commit()
+                    st.rerun()
                 st.write("---")
         
-        # --- SHOPPING LIST BUILDER ---
-        # Get all meals where on_menu is TRUE
+        # Prepare the shopping list data
         c.execute("SELECT id FROM meals WHERE on_menu = TRUE")
         selected_meal_ids = [row[0] for row in c.fetchall()]
         
+        tallied_ingredients = {}
         if len(selected_meal_ids) > 0:
-            st.write("### 🛒 Your Interactive Shopping List")
             placeholders = ','.join(['%s'] * len(selected_meal_ids)) 
             c.execute(f"SELECT name FROM ingredients WHERE meal_id IN ({placeholders})", selected_meal_ids)
             tallied_ingredients = Counter([item[0] for item in c.fetchall()])
-            
-            for item, count in tallied_ingredients.items():
-                col_name, col_basket, col_pantry = st.columns([0.5, 0.25, 0.25])
-                with col_basket: in_basket = st.checkbox("🛒 Basket", key=f"basket_{item}")
-                with col_pantry: in_pantry = st.checkbox("🏠 Have It", key=f"pantry_{item}")
-                with col_name:
-                    display_name = f"{item} **(x{count})**" if count > 1 else f"{item}"
-                    if in_basket or in_pantry: st.write(f"~~{display_name}~~")
-                    else: st.write(f"- {display_name}")
-            
-            st.write("---")
-            st.write("### 🥛 Recurring Staples")
-            for staple in all_staples:
-                item_name = staple[0]
-                col_s_name, col_s_basket, col_s_pantry = st.columns([0.5, 0.25, 0.25])
-                with col_s_basket: s_in_basket = st.checkbox("🛒 Basket", key=f"sbasket_{item_name}")
-                with col_s_pantry: s_in_pantry = st.checkbox("🏠 Have It", key=f"spantry_{item_name}")
-                with col_s_name:
-                    display_s_name = f"**{item_name}**"
-                    if s_in_basket or s_in_pantry: st.write(f"~~{display_s_name}~~")
-                    else: st.write(f"- {display_s_name}")
-            
-            st.write("---")
-            
-            # --- UPDATED CHECKOUT BUTTON ---
-            if st.button("✅ Checkout & Wipe Menu", type="primary"):
-                items_updated = 0
-                today_str = datetime.now().strftime("%Y-%m-%d")
-                
-                # 1. Update Staples
-                c.execute("SELECT id, name, frequency FROM staples")
-                for s_id, s_name, s_freq in c.fetchall():
-                    if st.session_state.get(f"sbasket_{s_name}", False):
-                        next_due = calculate_next_due(s_freq)
-                        c.execute("UPDATE staples SET last_purchased = %s, next_due = %s WHERE id = %s", (today_str, next_due, s_id))
-                        items_updated += 1
-                
-                # 2. NEW: Wipe the Family Menu clean!
-                c.execute("UPDATE meals SET on_menu = FALSE")
-                
-                conn.commit()
-                st.success(f"Checkout complete! Updated dates for {items_updated} staples, and wiped the menu clean for next week!")
-                
-                # Refresh the page to show the empty grid
-                st.rerun()
+        
+        # VERY IMPORTANT: Close the connection before drawing the interactive list!
+        conn.close()
+        
+        # Render the instant "Fragment" list
+        if len(selected_meal_ids) > 0:
+            render_interactive_list(tallied_ingredients, all_staples)
 
-    conn.close()
 
 # --- TAB 3: RECURRING STAPLES ---
 with tab3:
