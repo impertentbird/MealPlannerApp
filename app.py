@@ -103,9 +103,17 @@ def render_interactive_list(tallied_ingredients, all_staples):
         c.execute("UPDATE meals SET on_menu = FALSE")
         conn.commit()
         conn.close()
+        
+        # --- NEW: THE MEMORY ERASER ---
+        # We must delete the checkboxes from Streamlit's short-term memory
+        # so they don't instantly overwrite the database we just wiped!
+        for key in list(st.session_state.keys()):
+            if key.startswith("chk_") or key.startswith("basket_") or key.startswith("pantry_") or key.startswith("sbasket_") or key.startswith("spantry_"):
+                del st.session_state[key]
+        # ------------------------------
+                
         st.success(f"Checkout complete! Updated dates for {items_updated} staples, and wiped the menu clean!")
-        st.rerun() # This forces the whole app to refresh and clear the screen
-
+        st.rerun() # Now when it reruns, the memory is completely blank!
 
 # --- 3. THE DASHBOARD ---
 st.set_page_config(page_title="My Meal Planner", page_icon="🍳", layout="wide")
